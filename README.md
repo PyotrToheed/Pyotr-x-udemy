@@ -100,6 +100,15 @@ python udemy_downloader.py "https://www.udemy.com/course/COURSE-SLUG/" -c cookie
 # List all your enrolled courses (supports 1000+)
 python udemy_downloader.py --list -c cookies.txt
 
+# List courses with total duration
+python udemy_downloader.py --list -c cookies.txt --dur
+
+# List courses with duration and save to file
+python udemy_downloader.py --list -c cookies.txt --dur --save all_courses.txt
+
+# List courses with DRM tags and save as CSV (Excel)
+python udemy_downloader.py --list -c cookies.txt --dur --dif_drm --save all_courses.txt
+
 # Download a specific course
 python udemy_downloader.py "https://www.udemy.com/course/COURSE-SLUG/" -c cookies.txt
 
@@ -127,6 +136,8 @@ python udemy_downloader.py "URL" -c cookies.txt --force
 | `--chapters` | Chapter filter (e.g. `1,3-5,7`) | All chapters |
 | `--list` | List all enrolled courses and exit | - |
 | `--save FILE` | Save course list to a file (use with `--list`) | - |
+| `--dur` | Show total duration of each course (use with `--list`) | - |
+| `--dif_drm` | Tag courses with DRM status; saves as CSV for Excel (use with `--list`) | - |
 | `--force` | Override daily course limit | - |
 
 ## Output Structure

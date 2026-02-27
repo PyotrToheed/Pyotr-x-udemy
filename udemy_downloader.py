@@ -31,6 +31,7 @@ import os
 import sys
 import re
 import json
+import csv
 import time
 import random
 import base64
@@ -80,7 +81,7 @@ CURRICULUM_PARAMS = {
 }
 
 MY_COURSES_PARAMS = {
-    "fields[course]": "id,url,title,published_title",
+    "fields[course]": "id,url,title,published_title,estimated_content_length",
     "ordering": "-last_accessed,-access_time",
     "page_size": "100",
 }
@@ -388,33 +389,146 @@ class UdemyDownloader:
         print(f"  Found {len(all_courses)} enrolled courses" + " " * 20)
         return all_courses
 
-    def list_courses(self, save_path=None):
+    def _check_course_drm(self, course_id):
+        """Check if a course has DRM-protected videos."""
+        url = (
+            f"https://{self.portal}.udemy.com/api-2.0/courses/"
+            f"{course_id}/subscriber-curriculum-items/"
+        )
+        params = {
+            "fields[lecture]": "asset",
+            "fields[asset]": "course_is_drmed,asset_type",
+            "page_size": "20",
+        }
+        try:
+            data = self.session.get_json(url, params)
+            for item in data.get("results", []):
+                if item.get("_class") == "lecture":
+                    asset = item.get("asset", {})
+                    if asset.get("asset_type") == "Video":
+                        return bool(asset.get("course_is_drmed"))
+            return False
+        except Exception:
+            return None
+
+    def list_courses(self, save_path=None, show_dur=False, show_drm=False):
         """List all enrolled courses. Optionally save to file."""
         courses = self._fetch_all_courses()
+
+        # Check DRM status for each course
+        drm_status = {}
+        if show_drm:
+            total = len(courses)
+            print(f"\n  Checking DRM status for {total} courses...")
+            for i, c in enumerate(courses, 1):
+                cid = c.get("id")
+                print(f"  Checking DRM: {i}/{total}...", end="\r", flush=True)
+                drm_status[cid] = self._check_course_drm(cid)
+                safe_delay(DELAY_API)
+            print(f"  DRM check complete for {total} courses" + " " * 20)
 
         print(f"\n{'='*60}")
         print(f"  Enrolled Courses ({len(courses)})")
         print(f"{'='*60}")
 
         lines = []
+        csv_rows = []
+        total_minutes = 0
+        drm_count = 0
+        non_drm_count = 0
+
         for i, c in enumerate(courses, 1):
             title = c.get("title", "Untitled")
             slug = c.get("published_title", c.get("id"))
             url = f"https://www.udemy.com/course/{slug}/"
-            print(f"  {i:4d}. {title}")
+
+            dur_str = ""
+            dur_val = ""
+            if show_dur:
+                mins = c.get("estimated_content_length") or 0
+                total_minutes += mins
+                hours, rem = divmod(int(mins), 60)
+                if hours > 0:
+                    dur_str = f" [{hours}h {rem}m]"
+                    dur_val = f"{hours}h {rem}m"
+                else:
+                    dur_str = f" [{rem}m]"
+                    dur_val = f"{rem}m"
+
+            drm_str = ""
+            drm_val = ""
+            if show_drm:
+                cid = c.get("id")
+                is_drm = drm_status.get(cid)
+                if is_drm:
+                    drm_str = " [DRM]"
+                    drm_val = "DRM"
+                    drm_count += 1
+                elif is_drm is False:
+                    drm_val = "No DRM"
+                    non_drm_count += 1
+                else:
+                    drm_val = "Unknown"
+
+            print(f"  {i:4d}. {title}{dur_str}{drm_str}")
             print(f"        {url}")
-            lines.append(f"{i}. {title}\n   {url}")
+            lines.append(f"{i}. {title}{dur_str}{drm_str}\n   {url}")
+            csv_rows.append({
+                "num": i, "title": title, "url": url,
+                "duration": dur_val, "drm": drm_val,
+            })
         print()
 
+        if show_dur:
+            total_h, total_m = divmod(int(total_minutes), 60)
+            print(f"  Total Duration: {total_h}h {total_m}m ({int(total_minutes)} minutes)")
+
+        if show_drm:
+            print(f"  DRM Courses: {drm_count} | Non-DRM: {non_drm_count}")
+
+        if show_dur or show_drm:
+            print()
+
+        # Save to file
         if save_path:
             out = Path(save_path)
-            out.write_text(
-                f"Udemy Enrolled Courses ({len(courses)})\n"
-                f"{'=' * 50}\n\n"
-                + "\n\n".join(lines) + "\n",
-                encoding="utf-8",
-            )
-            print(f"  Saved {len(courses)} courses to: {out}")
+            if show_drm:
+                # Save as CSV (opens in Excel)
+                csv_path = out.with_suffix(".csv")
+                with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    headers = ["#", "Title", "URL"]
+                    if show_dur:
+                        headers.append("Duration")
+                    headers.append("DRM Status")
+                    writer.writerow(headers)
+                    for row in csv_rows:
+                        r = [row["num"], row["title"], row["url"]]
+                        if show_dur:
+                            r.append(row["duration"])
+                        r.append(row["drm"])
+                        writer.writerow(r)
+                    # Summary row
+                    if show_dur or show_drm:
+                        writer.writerow([])
+                        if show_dur:
+                            total_h, total_m = divmod(int(total_minutes), 60)
+                            writer.writerow(["", f"Total Duration: {total_h}h {total_m}m"])
+                        if show_drm:
+                            writer.writerow(["", f"DRM: {drm_count} | Non-DRM: {non_drm_count}"])
+                print(f"  Saved {len(courses)} courses to: {csv_path}")
+            else:
+                # Save as plain text
+                header = f"Udemy Enrolled Courses ({len(courses)})\n{'=' * 50}\n"
+                if show_dur:
+                    total_h, total_m = divmod(int(total_minutes), 60)
+                    header += f"Total Duration: {total_h}h {total_m}m ({int(total_minutes)} minutes)\n"
+                header += "\n"
+                out.write_text(
+                    header + "\n\n".join(lines) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"  Saved {len(courses)} courses to: {out}")
 
         return courses
 
@@ -1028,6 +1142,14 @@ def main():
         "--force", action="store_true",
         help="Override daily course limit (use with caution)"
     )
+    parser.add_argument(
+        "--dur", action="store_true",
+        help="Show total duration of each course (use with --list)"
+    )
+    parser.add_argument(
+        "--dif_drm", action="store_true",
+        help="Tag courses with DRM status; saves as CSV for Excel (use with --list)"
+    )
 
     args = parser.parse_args()
 
@@ -1057,7 +1179,7 @@ def main():
     dl = UdemyDownloader(session, args.output, args.quality)
 
     if args.list:
-        dl.list_courses(save_path=args.save)
+        dl.list_courses(save_path=args.save, show_dur=args.dur, show_drm=args.dif_drm)
         return
 
     if not args.url:
