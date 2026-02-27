@@ -390,7 +390,7 @@ class UdemyDownloader:
         return all_courses
 
     def _check_course_drm(self, course_id):
-        """Check if a course has DRM-protected videos."""
+        """Check if a course has DRM-protected videos. Returns True/False/'N/A'/None."""
         url = (
             f"https://{self.portal}.udemy.com/api-2.0/courses/"
             f"{course_id}/subscriber-curriculum-items/"
@@ -398,18 +398,28 @@ class UdemyDownloader:
         params = {
             "fields[lecture]": "asset",
             "fields[asset]": "course_is_drmed,asset_type",
-            "page_size": "20",
+            "page_size": "50",
         }
-        try:
-            data = self.session.get_json(url, params)
-            for item in data.get("results", []):
-                if item.get("_class") == "lecture":
-                    asset = item.get("asset", {})
-                    if asset.get("asset_type") == "Video":
-                        return bool(asset.get("course_is_drmed"))
-            return False
-        except Exception:
-            return None
+        for attempt in range(2):
+            try:
+                data = self.session.get_json(url, params)
+                has_lectures = False
+                for item in data.get("results", []):
+                    if item.get("_class") == "lecture":
+                        has_lectures = True
+                        asset = item.get("asset", {})
+                        if asset.get("asset_type") == "Video":
+                            return bool(asset.get("course_is_drmed"))
+                # Course has lectures but no video (articles/quizzes only)
+                if has_lectures:
+                    return "N/A"
+                # No lectures at all (practice test, empty course)
+                return "N/A"
+            except Exception:
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                return "N/A"
 
     def _load_drm_cache(self, csv_path):
         """Load previous DRM results from CSV, return {url: 'DRM'|'No DRM'}."""
@@ -432,7 +442,7 @@ class UdemyDownloader:
                     if len(row) > max(drm_idx, url_idx):
                         url = row[url_idx].strip()
                         drm_val = row[drm_idx].strip()
-                        if url and drm_val in ("DRM", "No DRM"):
+                        if url and drm_val in ("DRM", "No DRM", "N/A"):
                             cache[url] = drm_val
         except (FileNotFoundError, StopIteration):
             pass
@@ -458,7 +468,13 @@ class UdemyDownloader:
                 slug = c.get("published_title", c.get("id"))
                 url = f"https://www.udemy.com/course/{slug}/"
                 if url in drm_cache:
-                    drm_status[cid] = drm_cache[url] == "DRM"
+                    val = drm_cache[url]
+                    if val == "DRM":
+                        drm_status[cid] = True
+                    elif val == "N/A":
+                        drm_status[cid] = "N/A"
+                    else:
+                        drm_status[cid] = False
                 else:
                     to_check.append(c)
 
@@ -510,7 +526,9 @@ class UdemyDownloader:
             if show_drm:
                 cid = c.get("id")
                 is_drm = drm_status.get(cid)
-                if is_drm:
+                if is_drm == "N/A":
+                    drm_val = "N/A"
+                elif is_drm is True:
                     drm_str = " [DRM]"
                     drm_val = "DRM"
                     drm_count += 1
