@@ -411,6 +411,33 @@ class UdemyDownloader:
         except Exception:
             return None
 
+    def _load_drm_cache(self, csv_path):
+        """Load previous DRM results from CSV, return {url: 'DRM'|'No DRM'}."""
+        cache = {}
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers:
+                    return cache
+                drm_idx = url_idx = None
+                for i, h in enumerate(headers):
+                    if "DRM" in h.upper():
+                        drm_idx = i
+                    if "URL" in h.upper():
+                        url_idx = i
+                if drm_idx is None or url_idx is None:
+                    return cache
+                for row in reader:
+                    if len(row) > max(drm_idx, url_idx):
+                        url = row[url_idx].strip()
+                        drm_val = row[drm_idx].strip()
+                        if url and drm_val in ("DRM", "No DRM"):
+                            cache[url] = drm_val
+        except (FileNotFoundError, StopIteration):
+            pass
+        return cache
+
     def list_courses(self, save_path=None, show_dur=False, show_drm=False):
         """List all enrolled courses. Optionally save to file."""
         courses = self._fetch_all_courses()
@@ -418,14 +445,37 @@ class UdemyDownloader:
         # Check DRM status for each course
         drm_status = {}
         if show_drm:
-            total = len(courses)
-            print(f"\n  Checking DRM status for {total} courses...")
-            for i, c in enumerate(courses, 1):
+            # Load cached results from existing CSV
+            drm_cache = {}
+            if save_path:
+                csv_path = Path(save_path).with_suffix(".csv")
+                drm_cache = self._load_drm_cache(csv_path)
+
+            # Build URL->course_id mapping and find what needs checking
+            to_check = []
+            for c in courses:
                 cid = c.get("id")
-                print(f"  Checking DRM: {i}/{total}...", end="\r", flush=True)
+                slug = c.get("published_title", c.get("id"))
+                url = f"https://www.udemy.com/course/{slug}/"
+                if url in drm_cache:
+                    drm_status[cid] = drm_cache[url] == "DRM"
+                else:
+                    to_check.append(c)
+
+            cached = len(courses) - len(to_check)
+            if cached > 0:
+                print(f"\n  Loaded {cached} cached DRM results, {len(to_check)} remaining...")
+            else:
+                print(f"\n  Checking DRM status for {len(courses)} courses...")
+
+            for i, c in enumerate(to_check, 1):
+                cid = c.get("id")
+                print(f"  Checking DRM: {i}/{len(to_check)}...", end="\r", flush=True)
                 drm_status[cid] = self._check_course_drm(cid)
                 safe_delay(DELAY_API)
-            print(f"  DRM check complete for {total} courses" + " " * 20)
+
+            if to_check:
+                print(f"  DRM check complete" + " " * 30)
 
         print(f"\n{'='*60}")
         print(f"  Enrolled Courses ({len(courses)})")
