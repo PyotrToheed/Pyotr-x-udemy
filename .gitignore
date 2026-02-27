@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# CDM files (sensitive - do NOT share)
+cdm/device.wvd
+cdm/*.pem
+cdm/*.der
+cdm/*.bin
+cdm/*.dat
+
+# User data
+cookies.txt
+*.cookies
+downloads/
+test_download/
+.download_state.json
+
+# IDE
+.claude/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp
+*.tmp
+*.log
+
+# Large binaries
+frida-server*
+*.so
+*.xz

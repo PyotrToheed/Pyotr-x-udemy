@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Udemy Cookie Exporter",
+  "version": "1.0",
+  "description": "Export Udemy cookies in Netscape format for course downloader",
+  "permissions": ["cookies"],
+  "host_permissions": ["*://*.udemy.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "icons": {
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}
