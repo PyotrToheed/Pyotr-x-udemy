@@ -17,6 +17,7 @@ Works with **1000+ enrolled courses** via automatic pagination. Includes built-i
 - **Account Safety** - Built-in rate limiting and daily course limits
 - **Interactive Mode** - Browse and select courses from your library
 - **Pagination** - Handles 1000+ enrolled courses automatically
+- **AI Categorization** - Auto-categorize courses using OpenAI (Category + Subcategory in CSV)
 
 ## How It Works
 
@@ -107,7 +108,13 @@ python udemy_downloader.py --list -c cookies.txt --dur
 python udemy_downloader.py --list -c cookies.txt --dur --save all_courses.txt
 
 # List courses with DRM tags and save as CSV (Excel)
-python udemy_downloader.py --list -c cookies.txt --dur --dif_drm --save all_courses.txt
+python udemy_downloader.py --list -c cookies.txt --dur --dif_drm --save all_courses.csv
+
+# List courses with AI-powered categorization (requires OpenAI API key)
+python udemy_downloader.py --list -c cookies.txt --dur --dif_drm --cat --api_key "sk-..." --save all_courses.csv
+
+# Categorize an existing CSV file (no cookies needed, standalone)
+python udemy_downloader.py --categorize all_courses.csv --api_key "sk-..."
 
 # Download a specific course
 python udemy_downloader.py "https://www.udemy.com/course/COURSE-SLUG/" -c cookies.txt
@@ -138,6 +145,9 @@ python udemy_downloader.py "URL" -c cookies.txt --force
 | `--save FILE` | Save course list to a file (use with `--list`) | - |
 | `--dur` | Show total duration of each course (use with `--list`) | - |
 | `--dif_drm` | Tag courses with DRM status; saves as CSV for Excel (use with `--list`) | - |
+| `--cat` | Add AI-generated Category & Subcategory columns (use with `--list --save`) | - |
+| `--api_key KEY` | OpenAI API key for `--cat` / `--categorize` (or set `OPENAI_API_KEY` env var) | - |
+| `--categorize FILE` | Categorize an existing CSV file (standalone, no cookies needed) | - |
 | `--force` | Override daily course limit | - |
 
 ## Output Structure
