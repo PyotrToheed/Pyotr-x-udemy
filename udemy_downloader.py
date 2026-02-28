@@ -1309,6 +1309,155 @@ class UdemyDownloader:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Standalone CSV Categorizer
+# ═══════════════════════════════════════════════════════════════════
+def _categorize_csv_file(csv_file, api_key):
+    """Categorize an existing CSV file without needing Udemy session."""
+    csv_path = Path(csv_file)
+    if not csv_path.exists():
+        print(f"ERROR: File not found: {csv_path}")
+        sys.exit(1)
+
+    print(f"\n  Udemy Course Categorizer v{VERSION}")
+    print(f"  {'─'*40}")
+    print(f"  Reading: {csv_path}")
+
+    # Read existing CSV
+    rows = []
+    headers = []
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        headers = next(reader, [])
+        for row in reader:
+            if row and row[0]:  # skip empty/summary rows
+                rows.append(row)
+
+    # Find column indices
+    col = {}
+    for i, h in enumerate(headers):
+        hl = h.strip().upper()
+        if hl == "#":
+            col["num"] = i
+        elif hl == "TITLE":
+            col["title"] = i
+        elif hl == "URL":
+            col["url"] = i
+        elif hl == "CATEGORY":
+            col["cat"] = i
+        elif hl == "SUBCATEGORY":
+            col["sub"] = i
+
+    if "title" not in col:
+        print("ERROR: CSV must have a 'Title' column")
+        sys.exit(1)
+
+    print(f"  Found {len(rows)} courses")
+
+    # Find which rows need categorization
+    has_cat_cols = "cat" in col and "sub" in col
+    to_categorize = []
+    for idx, row in enumerate(rows):
+        if has_cat_cols and len(row) > col["sub"]:
+            cat = row[col["cat"]].strip()
+            if cat:  # already categorized
+                continue
+        to_categorize.append(idx)
+
+    if not to_categorize:
+        print("  All courses already categorized!")
+        return
+
+    cached = len(rows) - len(to_categorize)
+    if cached > 0:
+        print(f"  Loaded {cached} cached categories, {len(to_categorize)} remaining...")
+    print(f"  Categorizing {len(to_categorize)} courses via OpenAI...")
+
+    # Add Category/Subcategory columns if missing
+    if not has_cat_cols:
+        headers.extend(["Category", "Subcategory"])
+        col["cat"] = len(headers) - 2
+        col["sub"] = len(headers) - 1
+        for row in rows:
+            row.extend(["", ""])
+
+    # Build OpenAI caller (reuse method via simple wrapper)
+    def call_openai(titles):
+        numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(titles))
+        prompt = (
+            "Categorize each course below into a Category and Subcategory.\n\n"
+            "Choose Category from: Cyber Security, Programming, Web Development, "
+            "Mobile Development, Data Science & AI, Cloud & DevOps, Networking, "
+            "Database, Game Development, Design & UX, Digital Marketing, "
+            "Business & Entrepreneurship, Finance & Accounting, "
+            "Photography & Video, Music & Audio, Personal Development, "
+            "IT & Software, Blockchain & Crypto, Other\n\n"
+            "Subcategory should be specific (e.g., Python, Ethical Hacking, "
+            "React, AWS, SEO, Machine Learning, etc.)\n\n"
+            f"Courses:\n{numbered}\n\n"
+            'Return ONLY a JSON object: {"results": [{"i": 0, "cat": "...", "sub": "..."},...]} '
+            "with an entry for every course index."
+        )
+        payload = json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read())
+            content = data["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```\w*\n?", "", content)
+                content = re.sub(r"\n?```$", "", content)
+            parsed = json.loads(content)
+            results = parsed.get("results", parsed.get("courses", []))
+            out = {}
+            for item in results:
+                idx = item.get("i", item.get("index", -1))
+                out[idx] = (item.get("cat", "Other"), item.get("sub", ""))
+            return out
+        except Exception as e:
+            print(f"\n  OpenAI API error: {e}")
+            return {}
+
+    # Process in batches of 30
+    batch_size = 30
+    for start in range(0, len(to_categorize), batch_size):
+        batch_indices = to_categorize[start:start + batch_size]
+        titles = [rows[idx][col["title"]] for idx in batch_indices]
+        done = min(start + batch_size, len(to_categorize))
+        print(f"  Categorizing: {done}/{len(to_categorize)}...", end="\r", flush=True)
+
+        result = call_openai(titles)
+        for j, row_idx in enumerate(batch_indices):
+            cat, sub = result.get(j, ("Other", ""))
+            rows[row_idx][col["cat"]] = cat
+            rows[row_idx][col["sub"]] = sub
+
+        time.sleep(0.5)
+
+    print(f"  Categorization complete!" + " " * 30)
+
+    # Write updated CSV
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(row)
+
+    print(f"  Saved to: {csv_path}")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════
 def main():
@@ -1326,7 +1475,7 @@ def main():
     )
     parser.add_argument("url", nargs="?", help="Udemy course URL or slug")
     parser.add_argument(
-        "-c", "--cookies", required=True, help="Path to cookies.txt (Netscape format)"
+        "-c", "--cookies", help="Path to cookies.txt (Netscape format)"
     )
     parser.add_argument(
         "-o", "--output", default="downloads", help="Output directory (default: downloads)"
@@ -1362,12 +1511,28 @@ def main():
         help="Categorize courses via OpenAI (use with --list --save; requires --api_key)"
     )
     parser.add_argument(
+        "--categorize", metavar="CSV_FILE",
+        help="Categorize an existing CSV file (standalone, no cookies needed)"
+    )
+    parser.add_argument(
         "--api_key", metavar="KEY",
-        help="OpenAI API key for --cat (or set OPENAI_API_KEY env var)"
+        help="OpenAI API key for --cat/--categorize (or set OPENAI_API_KEY env var)"
     )
 
     args = parser.parse_args()
 
+    # Standalone categorize mode: no cookies/session needed
+    if args.categorize:
+        oai_key = args.api_key or os.environ.get("OPENAI_API_KEY")
+        if not oai_key:
+            print("ERROR: --categorize requires --api_key KEY or OPENAI_API_KEY env var")
+            sys.exit(1)
+        _categorize_csv_file(args.categorize, oai_key)
+        return
+
+    if not args.cookies:
+        print("ERROR: -c/--cookies is required (except for --categorize)")
+        sys.exit(1)
     if not os.path.exists(args.cookies):
         print(f"ERROR: Cookie file not found: {args.cookies}")
         sys.exit(1)
