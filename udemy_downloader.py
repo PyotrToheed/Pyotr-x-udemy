@@ -39,6 +39,7 @@ import subprocess
 import shutil
 import tempfile
 import argparse
+import urllib.request
 from pathlib import Path
 from http.cookiejar import MozillaCookieJar
 
@@ -448,7 +449,135 @@ class UdemyDownloader:
             pass
         return cache
 
-    def list_courses(self, save_path=None, show_dur=False, show_drm=False):
+    def _load_category_cache(self, csv_path):
+        """Load previous category results from CSV, return {url: (cat, subcat)}."""
+        cache = {}
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers:
+                    return cache
+                url_idx = cat_idx = sub_idx = None
+                for i, h in enumerate(headers):
+                    hl = h.strip().upper()
+                    if hl == "URL":
+                        url_idx = i
+                    elif hl == "CATEGORY":
+                        cat_idx = i
+                    elif hl == "SUBCATEGORY":
+                        sub_idx = i
+                if url_idx is None or cat_idx is None or sub_idx is None:
+                    return cache
+                for row in reader:
+                    if len(row) > max(url_idx, cat_idx, sub_idx):
+                        url = row[url_idx].strip()
+                        cat = row[cat_idx].strip()
+                        sub = row[sub_idx].strip()
+                        if url and cat:
+                            cache[url] = (cat, sub)
+        except (FileNotFoundError, StopIteration):
+            pass
+        return cache
+
+    def _call_openai(self, titles_batch, api_key):
+        """Send a batch of course titles to OpenAI for categorization."""
+        numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(titles_batch))
+        prompt = (
+            "Categorize each course below into a Category and Subcategory.\n\n"
+            "Choose Category from: Cyber Security, Programming, Web Development, "
+            "Mobile Development, Data Science & AI, Cloud & DevOps, Networking, "
+            "Database, Game Development, Design & UX, Digital Marketing, "
+            "Business & Entrepreneurship, Finance & Accounting, "
+            "Photography & Video, Music & Audio, Personal Development, "
+            "IT & Software, Blockchain & Crypto, Other\n\n"
+            "Subcategory should be specific (e.g., Python, Ethical Hacking, "
+            "React, AWS, SEO, Machine Learning, etc.)\n\n"
+            f"Courses:\n{numbered}\n\n"
+            "Return ONLY a JSON object: {\"results\": [{\"i\": 0, \"cat\": \"...\", \"sub\": \"...\"},...]} "
+            "with an entry for every course index."
+        )
+
+        payload = json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read())
+            content = data["choices"][0]["message"]["content"]
+            # Strip markdown fences if present
+            content = content.strip()
+            if content.startswith("```"):
+                content = re.sub(r"^```\w*\n?", "", content)
+                content = re.sub(r"\n?```$", "", content)
+            parsed = json.loads(content)
+            results = parsed.get("results", parsed.get("courses", []))
+            out = {}
+            for item in results:
+                idx = item.get("i", item.get("index", -1))
+                out[idx] = (item.get("cat", "Other"), item.get("sub", ""))
+            return out
+        except Exception as e:
+            print(f"\n  OpenAI API error: {e}")
+            return {}
+
+    def categorize_courses(self, csv_rows, api_key, save_path=None):
+        """Categorize all courses using OpenAI. Returns updated csv_rows."""
+        # Load cached categories
+        cat_cache = {}
+        if save_path:
+            csv_path = Path(save_path).with_suffix(".csv")
+            cat_cache = self._load_category_cache(csv_path)
+
+        # Split into cached vs uncategorized
+        to_categorize = []
+        for row in csv_rows:
+            url = row["url"]
+            if url in cat_cache:
+                row["category"], row["subcategory"] = cat_cache[url]
+            else:
+                to_categorize.append(row)
+
+        cached = len(csv_rows) - len(to_categorize)
+        if cached > 0:
+            print(f"  Loaded {cached} cached categories, {len(to_categorize)} remaining...")
+        if not to_categorize:
+            print("  All courses already categorized.")
+            return csv_rows
+
+        print(f"  Categorizing {len(to_categorize)} courses via OpenAI...")
+
+        # Process in batches of 30
+        batch_size = 30
+        for start in range(0, len(to_categorize), batch_size):
+            batch = to_categorize[start:start + batch_size]
+            titles = [r["title"] for r in batch]
+            done = min(start + batch_size, len(to_categorize))
+            print(f"  Categorizing: {done}/{len(to_categorize)}...", end="\r", flush=True)
+
+            result = self._call_openai(titles, api_key)
+            for j, row in enumerate(batch):
+                cat, sub = result.get(j, ("Other", ""))
+                row["category"] = cat
+                row["subcategory"] = sub
+
+            time.sleep(0.5)
+
+        print(f"  Categorization complete for {len(to_categorize)} courses" + " " * 20)
+        return csv_rows
+
+    def list_courses(self, save_path=None, show_dur=False, show_drm=False, show_cat=False, api_key=None):
         """List all enrolled courses. Optionally save to file."""
         courses = self._fetch_all_courses()
 
@@ -557,10 +686,14 @@ class UdemyDownloader:
         if show_dur or show_drm:
             print()
 
+        # Categorize via OpenAI if requested
+        if show_cat and api_key:
+            csv_rows = self.categorize_courses(csv_rows, api_key, save_path)
+
         # Save to file
         if save_path:
             out = Path(save_path)
-            if show_drm:
+            if show_drm or show_cat:
                 # Save as CSV (opens in Excel)
                 csv_path = out.with_suffix(".csv")
                 with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -568,22 +701,28 @@ class UdemyDownloader:
                     headers = ["#", "Title", "URL"]
                     if show_dur:
                         headers.append("Duration")
-                    headers.append("DRM Status")
+                    if show_drm:
+                        headers.append("DRM Status")
+                    if show_cat:
+                        headers.extend(["Category", "Subcategory"])
                     writer.writerow(headers)
                     for row in csv_rows:
                         r = [row["num"], row["title"], row["url"]]
                         if show_dur:
                             r.append(row["duration"])
-                        r.append(row["drm"])
+                        if show_drm:
+                            r.append(row["drm"])
+                        if show_cat:
+                            r.append(row.get("category", ""))
+                            r.append(row.get("subcategory", ""))
                         writer.writerow(r)
                     # Summary row
-                    if show_dur or show_drm:
-                        writer.writerow([])
-                        if show_dur:
-                            total_h, total_m = divmod(int(total_minutes), 60)
-                            writer.writerow(["", f"Total Duration: {total_h}h {total_m}m"])
-                        if show_drm:
-                            writer.writerow(["", f"DRM: {drm_count} | Non-DRM: {non_drm_count}"])
+                    writer.writerow([])
+                    if show_dur:
+                        total_h, total_m = divmod(int(total_minutes), 60)
+                        writer.writerow(["", f"Total Duration: {total_h}h {total_m}m"])
+                    if show_drm:
+                        writer.writerow(["", f"DRM: {drm_count} | Non-DRM: {non_drm_count}"])
                 print(f"  Saved {len(courses)} courses to: {csv_path}")
             else:
                 # Save as plain text
@@ -1218,6 +1357,14 @@ def main():
         "--dif_drm", action="store_true",
         help="Tag courses with DRM status; saves as CSV for Excel (use with --list)"
     )
+    parser.add_argument(
+        "--cat", action="store_true",
+        help="Categorize courses via OpenAI (use with --list --save; requires --api_key)"
+    )
+    parser.add_argument(
+        "--api_key", metavar="KEY",
+        help="OpenAI API key for --cat (or set OPENAI_API_KEY env var)"
+    )
 
     args = parser.parse_args()
 
@@ -1247,7 +1394,14 @@ def main():
     dl = UdemyDownloader(session, args.output, args.quality)
 
     if args.list:
-        dl.list_courses(save_path=args.save, show_dur=args.dur, show_drm=args.dif_drm)
+        oai_key = args.api_key or os.environ.get("OPENAI_API_KEY")
+        if args.cat and not oai_key:
+            print("ERROR: --cat requires --api_key KEY or OPENAI_API_KEY env var")
+            sys.exit(1)
+        dl.list_courses(
+            save_path=args.save, show_dur=args.dur,
+            show_drm=args.dif_drm, show_cat=args.cat, api_key=oai_key,
+        )
         return
 
     if not args.url:
