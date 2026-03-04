@@ -42,6 +42,15 @@ import argparse
 import urllib.request
 from pathlib import Path
 from http.cookiejar import MozillaCookieJar
+from collections import Counter, defaultdict
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 # Fix Windows console encoding
 if sys.platform == "win32":
@@ -113,6 +122,26 @@ def fmt_size(n):
     return f"{n:.1f} TB"
 
 
+def _parse_duration_to_minutes(dur_str):
+    """Convert '56h 58m', '57m', '1h 50m' to total minutes."""
+    if not dur_str or not dur_str.strip():
+        return 0
+    hours = mins = 0
+    h_match = re.search(r'(\d+)h', dur_str)
+    m_match = re.search(r'(\d+)m', dur_str)
+    if h_match:
+        hours = int(h_match.group(1))
+    if m_match:
+        mins = int(m_match.group(1))
+    return hours * 60 + mins
+
+
+def _format_minutes(total_mins):
+    """Convert total minutes to 'Xh Ym' string."""
+    h, m = divmod(int(total_mins), 60)
+    return f"{h}h {m}m" if h > 0 else f"{m}m"
+
+
 def parse_chapters(s):
     """Parse '1,3-5,7' into {1, 3, 4, 5, 7}."""
     result = set()
@@ -129,6 +158,27 @@ def parse_chapters(s):
 def safe_delay(delay_range):
     """Random delay to mimic human behavior."""
     time.sleep(random.uniform(*delay_range))
+
+
+def wait_for_network(timeout=600, check_interval=5):
+    """Block until internet is available. Returns True if restored, False if timed out."""
+    import socket
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=3).close()
+            return True
+        except OSError:
+            pass
+        try:
+            socket.create_connection(("1.1.1.1", 53), timeout=3).close()
+            return True
+        except OSError:
+            pass
+        print(f"\r         ⏳ Waiting for network... ({int(time.time() - start)}s)", end="", flush=True)
+        time.sleep(check_interval)
+    print()
+    return False
 
 
 def load_state():
@@ -959,19 +1009,32 @@ class UdemyDownloader:
 
         print(f"  [{num:03d}] {title} ({quality_label}p)...", end="", flush=True)
 
-        cmd = [
-            "yt-dlp", "--no-warnings", "--no-check-certificates",
-            "-o", str(output), url,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        for _dl_attempt in range(3):
+            cmd = [
+                "yt-dlp", "--no-warnings", "--no-check-certificates",
+                "-o", str(output), url,
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
 
-        if output.exists() and output.stat().st_size > 1000:
-            sz = output.stat().st_size / 1024 / 1024
-            print(f" {sz:.1f} MB")
-            self.stats["downloaded"] += 1
-        else:
-            print(" FAILED")
-            self.stats["failed"] += 1
+            if output.exists() and output.stat().st_size > 1000:
+                sz = output.stat().st_size / 1024 / 1024
+                print(f" {sz:.1f} MB")
+                self.stats["downloaded"] += 1
+                return
+
+            # Download failed — wait for network and retry
+            if _dl_attempt < 2:
+                print(" failed, waiting for network...", end="", flush=True)
+                if output.exists():
+                    output.unlink()
+                if wait_for_network(timeout=300):
+                    print(" restored, retrying...", end="", flush=True)
+                    safe_delay((2.0, 4.0))
+                else:
+                    break
+
+        print(" FAILED")
+        self.stats["failed"] += 1
 
     def _dl_drm(self, media_sources, output, num, title, lecture_id=None):
         """Download DRM-protected video: get keys -> download -> decrypt."""
@@ -999,81 +1062,136 @@ class UdemyDownloader:
             return
 
         # Fetch FRESH license token per-lecture (tokens expire in ~3-5 min)
+        # Retry up to 5 times with network wait on failure
         license_token = None
-        if lecture_id and self.course_id:
-            try:
-                url = (
-                    f"https://{self.portal}.udemy.com/api-2.0/users/me/"
-                    f"subscribed-courses/{self.course_id}/lectures/{lecture_id}/"
-                )
-                r = self.session.get(url, params={
-                    "fields[lecture]": "asset",
-                    "fields[asset]": "media_license_token,media_sources",
-                })
-                if r.status_code == 200:
-                    fresh = r.json().get("asset", {})
-                    license_token = fresh.get("media_license_token")
-                    fresh_sources = fresh.get("media_sources", [])
-                    if fresh_sources:
-                        for src in fresh_sources:
-                            if src.get("type") == "application/dash+xml":
-                                mpd_url = src.get("src")
-                                break
-            except Exception:
-                pass
+        max_token_retries = 5
+        for _token_attempt in range(max_token_retries):
+            if lecture_id and self.course_id:
+                try:
+                    url = (
+                        f"https://{self.portal}.udemy.com/api-2.0/users/me/"
+                        f"subscribed-courses/{self.course_id}/lectures/{lecture_id}/"
+                    )
+                    r = self.session.get(url, params={
+                        "fields[lecture]": "asset",
+                        "fields[asset]": "media_license_token,media_sources",
+                    }, timeout=15)
+                    if r.status_code == 200:
+                        fresh = r.json().get("asset", {})
+                        license_token = fresh.get("media_license_token")
+                        fresh_sources = fresh.get("media_sources", [])
+                        if fresh_sources:
+                            for src in fresh_sources:
+                                if src.get("type") == "application/dash+xml":
+                                    mpd_url = src.get("src")
+                                    break
+                    elif r.status_code in (403, 429):
+                        # Rate limited or auth issue — wait longer
+                        print(f"  [{num:03d}] {title} - API {r.status_code}, backing off (attempt {_token_attempt + 1}/{max_token_retries})...")
+                        safe_delay((10.0, 20.0))
+                        continue
+                except Exception as e:
+                    # Network error — connection dropped, timeout, etc.
+                    if _token_attempt < max_token_retries - 1:
+                        print(f"  [{num:03d}] {title} - Connection error, waiting for network (attempt {_token_attempt + 1}/{max_token_retries})...")
+                        if not wait_for_network(timeout=300):
+                            print(f"         Network timeout, giving up")
+                            break
+                        print(f"         Network restored, retrying...")
+                        safe_delay((3.0, 6.0))
+                        continue
+
+            if license_token:
+                break
+
+            # No token from API — wait for network and retry
+            if _token_attempt < max_token_retries - 1:
+                print(f"  [{num:03d}] {title} - No license token (attempt {_token_attempt + 1}/{max_token_retries}), retrying...")
+                if not wait_for_network(timeout=300):
+                    print(f"         Network timeout")
+                    break
+                safe_delay((5.0, 10.0))
 
         if not license_token:
-            print(f"  [{num:03d}] {title} - DRM (no license token)")
+            print(f"  [{num:03d}] {title} - DRM (no license token after {max_token_retries} attempts)")
             self.stats["failed"] += 1
             return
 
         print(f"  [{num:03d}] {title} (DRM)...")
 
-        # Step 1: Get decryption keys
-        print("         Getting keys...", end="", flush=True)
-        keys = self.drm.get_keys(self.session, mpd_url, license_token)
-        if not keys:
+        # Step 1: Get decryption keys (with network retry)
+        keys = None
+        for _key_attempt in range(3):
+            print("         Getting keys...", end="", flush=True)
+            keys = self.drm.get_keys(self.session, mpd_url, license_token)
+            if keys:
+                print(f" OK ({len(keys)} key(s))")
+                break
             print(" FAILED")
+            if _key_attempt < 2:
+                print("         Waiting for network...", end="", flush=True)
+                if wait_for_network(timeout=300):
+                    print(" restored, retrying...")
+                    safe_delay((2.0, 4.0))
+                else:
+                    break
+        if not keys:
             self.stats["failed"] += 1
             return
-        print(f" OK ({len(keys)} key(s))")
 
-        # Step 2: Download encrypted streams
+        # Step 2: Download encrypted streams (with network retry)
         tmpdir = tempfile.mkdtemp(prefix="udl_")
         try:
-            enc_v = os.path.join(tmpdir, "video.mp4")
-            enc_a = os.path.join(tmpdir, "audio.m4a")
+            video_file = None
+            audio_file = None
+            for _dl_attempt in range(3):
+                enc_v = os.path.join(tmpdir, "video.mp4")
+                enc_a = os.path.join(tmpdir, "audio.m4a")
 
-            print("         Downloading...", end="", flush=True)
-            subprocess.run(
-                [
-                    "yt-dlp", "--no-warnings", "--allow-unplayable-formats",
-                    "--no-check-certificates",
-                    "-f", "bestvideo", "-o", enc_v, mpd_url,
-                ],
-                capture_output=True,
-            )
-            subprocess.run(
-                [
-                    "yt-dlp", "--no-warnings", "--allow-unplayable-formats",
-                    "--no-check-certificates",
-                    "-f", "bestaudio", "-o", enc_a, mpd_url,
-                ],
-                capture_output=True,
-            )
+                print("         Downloading...", end="", flush=True)
+                subprocess.run(
+                    [
+                        "yt-dlp", "--no-warnings", "--allow-unplayable-formats",
+                        "--no-check-certificates",
+                        "-f", "bestvideo", "-o", enc_v, mpd_url,
+                    ],
+                    capture_output=True,
+                )
+                subprocess.run(
+                    [
+                        "yt-dlp", "--no-warnings", "--allow-unplayable-formats",
+                        "--no-check-certificates",
+                        "-f", "bestaudio", "-o", enc_a, mpd_url,
+                    ],
+                    capture_output=True,
+                )
 
-            video_file = next(
-                iter(sorted(Path(tmpdir).glob("video*"))), None
-            )
-            audio_file = next(
-                iter(sorted(Path(tmpdir).glob("audio*"))), None
-            )
+                video_file = next(
+                    iter(sorted(Path(tmpdir).glob("video*"))), None
+                )
+                audio_file = next(
+                    iter(sorted(Path(tmpdir).glob("audio*"))), None
+                )
+
+                if video_file:
+                    print(" OK")
+                    break
+                print(" download failed")
+                if _dl_attempt < 2:
+                    print("         Waiting for network...", end="", flush=True)
+                    if wait_for_network(timeout=300):
+                        print(" restored, retrying...")
+                        # Clean partial files before retry
+                        for f in Path(tmpdir).glob("*"):
+                            f.unlink()
+                        safe_delay((2.0, 4.0))
+                    else:
+                        break
 
             if not video_file:
-                print(" video download failed")
+                print("         Video download failed after retries")
                 self.stats["failed"] += 1
                 return
-            print(" OK")
 
             # Step 3: Decrypt + merge with ffmpeg
             print("         Decrypting...", end="", flush=True)
@@ -1365,6 +1483,10 @@ def _categorize_csv_file(csv_file, api_key):
 
     if not to_categorize:
         print("  All courses already categorized!")
+        xlsx_path = _build_excel_dashboard(csv_path)
+        if xlsx_path:
+            print(f"  Saved Excel Dashboard: {xlsx_path}")
+        print()
         return
 
     cached = len(rows) - len(to_categorize)
@@ -1453,8 +1575,350 @@ def _categorize_csv_file(csv_file, api_key):
         for row in rows:
             writer.writerow(row)
 
-    print(f"  Saved to: {csv_path}")
+    print(f"  Saved CSV: {csv_path}")
+
+    # Build Excel dashboard
+    xlsx_path = _build_excel_dashboard(csv_path)
+    if xlsx_path:
+        print(f"  Saved Excel Dashboard: {xlsx_path}")
     print()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Excel Dashboard
+# ═══════════════════════════════════════════════════════════════════
+def _build_courses_sheet(ws, headers, courses):
+    """Populate the 'All Courses' sheet with formatted course data."""
+    HEADER_FILL = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+    DRM_FILL = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
+    NORMAL_FONT = Font(name="Calibri", size=11)
+    THIN_BORDER = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+
+    # Write headers
+    for c_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=c_idx, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(horizontal="center")
+
+    # Write data rows
+    for r_idx, course in enumerate(courses, 2):
+        vals = [
+            course["num"], course["title"], course["url"],
+            course["duration"], course["drm"],
+            course["category"], course["subcategory"],
+        ]
+        is_drm = course["drm"] == "DRM"
+        for c_idx, val in enumerate(vals, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            cell.font = NORMAL_FONT
+            cell.border = THIN_BORDER
+            if is_drm:
+                cell.fill = DRM_FILL
+
+    # Column widths
+    widths = {"#": 5, "Title": 55, "URL": 50, "Duration": 12,
+              "DRM Status": 12, "Category": 25, "Subcategory": 25}
+    for c_idx, h in enumerate(headers, 1):
+        ws.column_dimensions[get_column_letter(c_idx)].width = widths.get(h, 15)
+
+    # Freeze top row + auto-filter
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(courses) + 1}"
+
+
+def _build_dashboard_sheet(ws, courses):
+    """Build the Dashboard sheet with stats, tables, and formatting."""
+    TITLE_FONT = Font(name="Calibri", bold=True, size=16, color="1F4E79")
+    SECTION_FONT = Font(name="Calibri", bold=True, size=13, color="1F4E79")
+    HEADER_FILL = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    HEADER_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+    STAT_LABEL_FONT = Font(name="Calibri", bold=True, size=11)
+    STAT_VALUE_FONT = Font(name="Calibri", size=11)
+    NORMAL_FONT = Font(name="Calibri", size=11)
+    BOLD_FONT = Font(name="Calibri", bold=True, size=11)
+    ALT_FILL = PatternFill(start_color="F2F7FB", end_color="F2F7FB", fill_type="solid")
+    DRM_RED = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
+    DRM_GREEN = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+    DRM_GRAY = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
+    THIN_BORDER = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+    CENTER = Alignment(horizontal="center")
+
+    # === Compute stats ===
+    total = len(courses)
+    total_mins = sum(c["duration_mins"] for c in courses)
+    drm_count = sum(1 for c in courses if c["drm"] == "DRM")
+    no_drm_count = sum(1 for c in courses if c["drm"] == "No DRM")
+    na_count = total - drm_count - no_drm_count
+
+    # Duration brackets: ≤1h, ≤2h, ..., ≤10h, ≤15h, ≤20h, ≤30h, 30h+
+    DUR_LIMITS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30]
+    DUR_LABELS = [f"≤{h}h" for h in DUR_LIMITS] + ["30h+"]
+
+    def dur_bracket(mins):
+        hours = mins / 60
+        for h in DUR_LIMITS:
+            if hours <= h:
+                return f"≤{h}h"
+        return "30h+"
+
+    def empty_brackets():
+        return {lbl: 0 for lbl in DUR_LABELS}
+
+    # Overall duration brackets
+    overall_dur = empty_brackets()
+    for c in courses:
+        overall_dur[dur_bracket(c["duration_mins"])] += 1
+
+    # Category breakdown
+    cat_counter = Counter(c["category"] or "Uncategorized" for c in courses)
+    cat_drm = defaultdict(int)
+    cat_nodrm = defaultdict(int)
+    cat_na = defaultdict(int)
+    cat_dur = defaultdict(int)
+    cat_dur_brackets = defaultdict(empty_brackets)
+    for c in courses:
+        cat = c["category"] or "Uncategorized"
+        if c["drm"] == "DRM":
+            cat_drm[cat] += 1
+        elif c["drm"] == "No DRM":
+            cat_nodrm[cat] += 1
+        else:
+            cat_na[cat] += 1
+        cat_dur[cat] += c["duration_mins"]
+        cat_dur_brackets[cat][dur_bracket(c["duration_mins"])] += 1
+    cat_sorted = sorted(cat_counter.items(), key=lambda x: x[1], reverse=True)
+
+    # Subcategory breakdown
+    def empty_sub():
+        d = {"count": 0, "drm": 0, "cat": "", "dur": 0}
+        d.update(empty_brackets())
+        return d
+    sub_data = defaultdict(empty_sub)
+    for c in courses:
+        sub = c["subcategory"]
+        if sub:
+            sub_data[sub]["count"] += 1
+            sub_data[sub]["cat"] = c["category"]
+            sub_data[sub]["dur"] += c["duration_mins"]
+            if c["drm"] == "DRM":
+                sub_data[sub]["drm"] += 1
+            sub_data[sub][dur_bracket(c["duration_mins"])] += 1
+    sub_sorted = sorted(sub_data.items(), key=lambda x: x[1]["count"], reverse=True)
+
+    # Column widths — B-G fixed cols, H onwards for duration brackets
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["D"].width = 10
+    ws.column_dimensions["E"].width = 10
+    ws.column_dimensions["F"].width = 10
+    ws.column_dimensions["G"].width = 14
+    for i in range(len(DUR_LABELS)):
+        col_letter = get_column_letter(8 + i)  # H, I, J, ...
+        ws.column_dimensions[col_letter].width = 7
+
+    row = 1
+
+    # ── Section 1: Overview ──
+    ws.cell(row=row, column=2, value="Udemy Course Dashboard").font = TITLE_FONT
+    row += 2
+
+    ws.cell(row=row, column=2, value="Overview").font = SECTION_FONT
+    row += 1
+
+    def pct(n):
+        return f"{n * 100 / total:.1f}%" if total > 0 else "0%"
+
+    overview_items = [
+        ("Total Courses", str(total)),
+        ("Total Duration", _format_minutes(total_mins)),
+        ("DRM Protected", f"{drm_count}  ({pct(drm_count)})"),
+        ("No DRM", f"{no_drm_count}  ({pct(no_drm_count)})"),
+        ("N/A / Unknown", f"{na_count}  ({pct(na_count)})"),
+        ("", ""),
+    ]
+    for lbl in DUR_LABELS:
+        n = overall_dur[lbl]
+        overview_items.append((f"Courses {lbl}", f"{n}  ({pct(n)})"))
+    for label, value in overview_items:
+        ws.cell(row=row, column=2, value=label).font = STAT_LABEL_FONT
+        ws.cell(row=row, column=3, value=value).font = STAT_VALUE_FONT
+        row += 1
+
+    row += 2
+
+    # ── Section 2: Category Breakdown ──
+    ws.cell(row=row, column=2, value="Category Breakdown").font = SECTION_FONT
+    row += 1
+
+    cat_headers = ["Category", "Courses", "DRM", "No DRM", "N/A", "Duration"] + DUR_LABELS
+    for c_idx, h in enumerate(cat_headers):
+        cell = ws.cell(row=row, column=c_idx + 2, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border = THIN_BORDER
+    row += 1
+
+    for i, (cat, count) in enumerate(cat_sorted):
+        fill = ALT_FILL if i % 2 == 0 else None
+        br = cat_dur_brackets[cat]
+        vals = [cat, count, cat_drm.get(cat, 0), cat_nodrm.get(cat, 0),
+                cat_na.get(cat, 0), _format_minutes(cat_dur.get(cat, 0))]
+        vals += [br[lbl] for lbl in DUR_LABELS]
+        for c_idx, val in enumerate(vals):
+            cell = ws.cell(row=row, column=c_idx + 2, value=val)
+            cell.font = NORMAL_FONT
+            cell.border = THIN_BORDER
+            if fill:
+                cell.fill = fill
+            if c_idx >= 1:
+                cell.alignment = CENTER
+        row += 1
+
+    # Totals row
+    total_vals = ["TOTAL", total, drm_count, no_drm_count, na_count, _format_minutes(total_mins)]
+    total_vals += [overall_dur[lbl] for lbl in DUR_LABELS]
+    for c_idx, val in enumerate(total_vals):
+        cell = ws.cell(row=row, column=c_idx + 2, value=val)
+        cell.font = BOLD_FONT
+        cell.border = THIN_BORDER
+        if c_idx >= 1:
+            cell.alignment = CENTER
+    row += 3
+
+    # ── Section 3: Top Subcategories ──
+    ws.cell(row=row, column=2, value="Top Subcategories").font = SECTION_FONT
+    row += 1
+
+    sub_headers = ["Subcategory", "Category", "Courses", "DRM", "Duration"] + DUR_LABELS
+    for c_idx, h in enumerate(sub_headers):
+        cell = ws.cell(row=row, column=c_idx + 2, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border = THIN_BORDER
+    row += 1
+
+    for i, (sub, info) in enumerate(sub_sorted[:50]):
+        fill = ALT_FILL if i % 2 == 0 else None
+        vals = [sub, info["cat"], info["count"], info["drm"],
+                _format_minutes(info["dur"])]
+        vals += [info[lbl] for lbl in DUR_LABELS]
+        for c_idx, val in enumerate(vals):
+            cell = ws.cell(row=row, column=c_idx + 2, value=val)
+            cell.font = NORMAL_FONT
+            cell.border = THIN_BORDER
+            if fill:
+                cell.fill = fill
+            if c_idx >= 2:
+                cell.alignment = CENTER
+        row += 1
+
+    row += 3
+
+    # ── Section 4: DRM Distribution ──
+    ws.cell(row=row, column=2, value="DRM Distribution").font = SECTION_FONT
+    row += 1
+
+    for c_idx, h in enumerate(["Status", "Courses", "Percentage"]):
+        cell = ws.cell(row=row, column=c_idx + 2, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border = THIN_BORDER
+    row += 1
+
+    for label, count, fill in [
+        ("DRM Protected", drm_count, DRM_RED),
+        ("No DRM", no_drm_count, DRM_GREEN),
+        ("N/A / Unknown", na_count, DRM_GRAY),
+    ]:
+        ws.cell(row=row, column=2, value=label).font = NORMAL_FONT
+        ws.cell(row=row, column=2).fill = fill
+        ws.cell(row=row, column=2).border = THIN_BORDER
+        cell_c = ws.cell(row=row, column=3, value=count)
+        cell_c.font = NORMAL_FONT
+        cell_c.alignment = CENTER
+        cell_c.border = THIN_BORDER
+        cell_p = ws.cell(row=row, column=4, value=pct(count))
+        cell_p.font = NORMAL_FONT
+        cell_p.alignment = CENTER
+        cell_p.border = THIN_BORDER
+        row += 1
+
+
+def _build_excel_dashboard(csv_path):
+    """Read categorized CSV and produce a multi-sheet .xlsx with dashboard."""
+    if not HAS_OPENPYXL:
+        print("  WARNING: openpyxl not installed. Run: pip install openpyxl")
+        return None
+
+    csv_path = Path(csv_path)
+    rows = []
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        headers = next(reader, [])
+        for row in reader:
+            if row and row[0].strip():
+                rows.append(row)
+
+    # Map column indices
+    col = {}
+    for i, h in enumerate(headers):
+        hl = h.strip().upper()
+        if hl == "#":            col["num"] = i
+        elif hl == "TITLE":      col["title"] = i
+        elif hl == "URL":        col["url"] = i
+        elif hl == "DURATION":   col["dur"] = i
+        elif "DRM" in hl:        col["drm"] = i
+        elif hl == "CATEGORY":   col["cat"] = i
+        elif hl == "SUBCATEGORY": col["sub"] = i
+
+    def safe_get(row, key):
+        if key in col and col[key] < len(row):
+            return row[col[key]].strip()
+        return ""
+
+    courses = []
+    for row in rows:
+        courses.append({
+            "num": safe_get(row, "num"),
+            "title": safe_get(row, "title"),
+            "url": safe_get(row, "url"),
+            "duration": safe_get(row, "dur"),
+            "duration_mins": _parse_duration_to_minutes(safe_get(row, "dur")),
+            "drm": safe_get(row, "drm"),
+            "category": safe_get(row, "cat"),
+            "subcategory": safe_get(row, "sub"),
+        })
+
+    wb = Workbook()
+
+    # Sheet 1: All Courses
+    ws_courses = wb.active
+    ws_courses.title = "All Courses"
+    _build_courses_sheet(ws_courses, headers, courses)
+
+    # Sheet 2: Dashboard
+    ws_dash = wb.create_sheet("Dashboard")
+    _build_dashboard_sheet(ws_dash, courses)
+
+    xlsx_path = csv_path.with_suffix(".xlsx")
+    wb.save(xlsx_path)
+    return xlsx_path
 
 
 # ═══════════════════════════════════════════════════════════════════
